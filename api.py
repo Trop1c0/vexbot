@@ -147,14 +147,22 @@ class PanelAPI(commands.Cog):
     def serialize_settings(self, settings: dict) -> dict:
         return {
             "tickets_channel": sid(settings["tickets_channel"]),
+            "tickets_category": sid(settings["tickets_category"]),
             "ticket_logs_channel": sid(settings["ticket_logs_channel"]),
             "member_logs_channel": sid(settings["member_logs_channel"]),
             "log_joins": settings["log_joins"], "log_leaves": settings["log_leaves"],
             "staff_roles": [str(r) for r in settings["staff_roles"]],
             "banner_url": settings["banner_url"],
             "banner_file": bool(settings["banner_file"]),
-            "games": settings["games"],
+            "games": {k: {**g, "role": sid(g.get("role"))} for k, g in settings["games"].items()},
         }
+
+    @staticmethod
+    def member_name(guild: discord.Guild, user_id: int | None) -> str | None:
+        if not user_id:
+            return None
+        member = guild.get_member(user_id)
+        return member.display_name if member else str(user_id)
 
     async def guild_info(self, request: web.Request):
         _, guild, _ = await self.manageable(request)
@@ -190,8 +198,10 @@ class PanelAPI(commands.Cog):
             "panel": {"channel": sid(panel["channel"]), "url": f"https://discord.com/channels/{guild.id}/{panel['channel']}/{panel['message']}"} if panel else None,
             "tickets": [{
                 "id": t["id"], "game": GAMES[t["game"]]["name"], "user": str(t["user"]), "username": t["username"],
-                "status": t["status"], "created": t["created"], "thread_url": t.get("thread_url"),
-                "steam": t["steam"], "note": t["note"],
+                "status": t["status"], "created": t["created"],
+                "channel_url": t.get("channel_url") if t["status"] in tickets.OPEN_STATUSES else None,
+                "steam": t["steam"], "steam64": t.get("steam64"), "note": t["note"],
+                "speaker": self.member_name(guild, t.get("speaker")),
             } for t in guild_tickets[:100]],
             "join_channels": [{"id": str(c.id), "name": c.name, "category": cat(c)} for c in joins],
             "rooms": rooms,
@@ -208,7 +218,10 @@ class PanelAPI(commands.Cog):
         _, guild, _ = await self.manageable(request)
         body = await request.json()
         settings = store.settings(guild.id)
-        before = {k: settings[k] for k in ("tickets_channel", "banner_url")} | {"games": repr(settings["games"])}
+        # only what is visible on the panel message; role changes don't need a re-post
+        panel_state = lambda: (settings["tickets_channel"], settings["banner_url"],  # noqa: E731
+                               repr([(g["enabled"], g["emoji"]) for g in settings["games"].values()]))
+        before = panel_state()
 
         for key in ("tickets_channel", "ticket_logs_channel", "member_logs_channel"):
             if key in body:
@@ -216,6 +229,11 @@ class PanelAPI(commands.Cog):
                 if cid and not isinstance(guild.get_channel(cid), discord.TextChannel):
                     raise fail(400, "Канал не найден на сервере")
                 settings[key] = cid
+        if "tickets_category" in body:
+            cid = parse_id(body["tickets_category"])
+            if cid and not isinstance(guild.get_channel(cid), discord.CategoryChannel):
+                raise fail(400, "Категория не найдена на сервере")
+            settings["tickets_category"] = cid
         for key in ("log_joins", "log_leaves"):
             if key in body:
                 settings[key] = bool(body[key])
@@ -236,15 +254,18 @@ class PanelAPI(commands.Cog):
                 emoji = str(game.get("emoji") or "").strip()
                 if len(emoji) > 80:
                     raise fail(400, "Слишком длинный эмодзи")
-                settings["games"][key] = {"enabled": bool(game.get("enabled")), "emoji": emoji}
+                role = parse_id(game.get("role"))
+                if role and guild.get_role(role) is None:
+                    raise fail(400, "Роль не найдена на сервере")
+                settings["games"][key] = {"enabled": bool(game.get("enabled")), "emoji": emoji, "role": role}
             if not any(g["enabled"] for g in settings["games"].values()):
                 raise fail(400, "Оставьте включённой хотя бы одну игру")
         store.save()
 
         warning = None
-        after = {k: settings[k] for k in ("tickets_channel", "banner_url")} | {"games": repr(settings["games"])}
+        after = panel_state()
         if after != before:
-            warning = await self.refresh_panel(guild, force=after["tickets_channel"] == before["tickets_channel"])
+            warning = await self.refresh_panel(guild, force=after[0] == before[0])
         return web.json_response({"settings": self.serialize_settings(settings), "warning": warning})
 
     async def refresh_panel(self, guild: discord.Guild, force: bool = True) -> str | None:
@@ -345,13 +366,13 @@ class PanelAPI(commands.Cog):
         ticket = store.data["tickets"].get(request.match_info["tid"])
         if not ticket or ticket.get("guild") != guild.id:
             raise fail(404, "Тикет не найден")
-        action = (await request.json()).get("action")
-        status = {"accept": "accepted", "decline": "declined", "close": "closed"}.get(action)
-        if not status:
+        if (await request.json()).get("action") != "close":
             raise fail(400, "Неизвестное действие")
         if ticket["status"] not in tickets.OPEN_STATUSES:
-            raise fail(400, "Тикет уже закрыт")
-        await tickets.set_status(self.bot, ticket, status, member)
+            raise fail(400, "Тикет уже завершён")
+        # Taking a ticket needs the author's consent in Discord; the panel can only finish it
+        await tickets.close_ticket(self.bot, ticket, member)
+        status = ticket["status"]
         return web.json_response({"status": status})
 
     async def send_message(self, request: web.Request):
