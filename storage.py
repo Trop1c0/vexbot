@@ -7,14 +7,16 @@ from config import GAMES, STATE_PATH
 def default_settings() -> dict:
     return {
         "tickets_channel": None,      # channel with the ticket panel
-        "ticket_logs_channel": None,  # ticket cards + MSG threads
+        "tickets_category": None,     # category where a channel is created for every ticket
+        "ticket_logs_channel": None,  # ticket cards + transcripts of closed tickets
         "member_logs_channel": None,  # join / leave logs
         "log_joins": True,
         "log_leaves": True,
         "staff_roles": [],
         "banner_url": "",
         "banner_file": None,          # uploaded file name in data/banners
-        "games": {key: {"enabled": True, "emoji": ""} for key in GAMES},
+        # role: speakers of this game, pinged in new tickets and allowed to take them
+        "games": {key: {"enabled": True, "emoji": "", "role": None} for key in GAMES},
     }
 
 
