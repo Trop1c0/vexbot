@@ -9,7 +9,7 @@ from storage import store
 
 log = logging.getLogger("vex")
 
-EXTENSIONS = ("tickets", "voice", "member_logs", "api")
+EXTENSIONS = ("tickets", "voice", "member_logs", "checker", "api")
 
 
 class VexBot(commands.Bot):
