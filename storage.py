@@ -10,6 +10,8 @@ def default_settings() -> dict:
         "tickets_category": None,     # category where a channel is created for every ticket
         "ticket_logs_channel": None,  # ticket cards + transcripts of closed tickets
         "member_logs_channel": None,  # join / leave logs
+        "checker_channel": None,      # Steam inventory checker
+        "checker_source": "lzt",      # inventory prices: lzt | steam | both (lzt falls back to steam)
         "log_joins": True,
         "log_leaves": True,
         "staff_roles": [],

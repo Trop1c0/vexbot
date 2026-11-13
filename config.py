@@ -23,6 +23,16 @@ API_SECRET = os.getenv("API_SECRET", "").strip()
 API_HOST = os.getenv("API_HOST", "127.0.0.1")
 API_PORT = int(os.getenv("API_PORT", "8081"))
 
+# ---- inventory checker ----
+# https://steamcommunity.com/dev/apikey — profile names, countries, /id/ links
+STEAM_API_KEY = os.getenv("STEAM_API_KEY", "").strip()
+# Optional, https://developers.faceit.com — FACEIT nickname / level / region line
+FACEIT_API_KEY = os.getenv("FACEIT_API_KEY", "").strip()
+# Optional, lzt.market -> API token with the "market" scope: inventory value in LZT prices
+LZT_API_TOKEN = os.getenv("LZT_API_TOKEN", "").strip()
+LZT_API_URL = os.getenv("LZT_API_URL", "https://api.lzt.market").rstrip("/")
+PRICES_PATH = BASE / "data" / "prices.json"
+
 STATE_PATH = BASE / "data" / "state.json"
 BANNERS_DIR = BASE / "data" / "banners"
 DEFAULT_BANNER = BASE / "assets" / "tickets.png"

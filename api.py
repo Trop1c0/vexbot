@@ -150,6 +150,8 @@ class PanelAPI(commands.Cog):
             "tickets_category": sid(settings["tickets_category"]),
             "ticket_logs_channel": sid(settings["ticket_logs_channel"]),
             "member_logs_channel": sid(settings["member_logs_channel"]),
+            "checker_channel": sid(settings["checker_channel"]),
+            "checker_source": settings["checker_source"],
             "log_joins": settings["log_joins"], "log_leaves": settings["log_leaves"],
             "staff_roles": [str(r) for r in settings["staff_roles"]],
             "banner_url": settings["banner_url"],
@@ -163,6 +165,11 @@ class PanelAPI(commands.Cog):
             return None
         member = guild.get_member(user_id)
         return member.display_name if member else str(user_id)
+
+    @staticmethod
+    def stat_periods() -> dict[str, int]:
+        now = int(discord.utils.utcnow().timestamp())
+        return {"7": now - 7 * 86400, "30": now - 30 * 86400, "all": 0}
 
     async def guild_info(self, request: web.Request):
         _, guild, _ = await self.manageable(request)
@@ -200,10 +207,18 @@ class PanelAPI(commands.Cog):
                 "id": t["id"], "game": GAMES[t["game"]]["name"], "user": str(t["user"]), "username": t["username"],
                 "status": t["status"], "created": t["created"],
                 "channel_url": t.get("channel_url") if t["status"] in tickets.OPEN_STATUSES else None,
+                "log_url": f"https://discord.com/channels/{guild.id}/{t['log_thread']}" if t.get("log_thread") else None,
                 "steam": t["steam"], "steam64": t.get("steam64"), "note": t["note"],
                 "speaker": self.member_name(guild, t.get("speaker")),
+                "result": t.get("result"), "reason": t.get("reason") or "", "rating": t.get("rating"),
             } for t in guild_tickets[:100]],
+            "speakers": {period: [
+                {**s, "name": self.member_name(guild, s["speaker"]), "speaker": str(s["speaker"])}
+                for s in tickets.speaker_stats(guild.id, since)
+            ] for period, since in self.stat_periods().items()},
             "join_channels": [{"id": str(c.id), "name": c.name, "category": cat(c)} for c in joins],
+            "checker": {"steam_key": bool(config.STEAM_API_KEY), "faceit_key": bool(config.FACEIT_API_KEY),
+                        "lzt_key": bool(config.LZT_API_TOKEN)},
             "rooms": rooms,
             "stats": {
                 "members": guild.member_count,
@@ -223,12 +238,16 @@ class PanelAPI(commands.Cog):
                                repr([(g["enabled"], g["emoji"]) for g in settings["games"].values()]))
         before = panel_state()
 
-        for key in ("tickets_channel", "ticket_logs_channel", "member_logs_channel"):
+        for key in ("tickets_channel", "ticket_logs_channel", "member_logs_channel", "checker_channel"):
             if key in body:
                 cid = parse_id(body[key])
                 if cid and not isinstance(guild.get_channel(cid), discord.TextChannel):
                     raise fail(400, "Канал не найден на сервере")
                 settings[key] = cid
+        if "checker_source" in body:
+            if body["checker_source"] not in ("lzt", "steam", "both"):
+                raise fail(400, "Неизвестный источник цен")
+            settings["checker_source"] = body["checker_source"]
         if "tickets_category" in body:
             cid = parse_id(body["tickets_category"])
             if cid and not isinstance(guild.get_channel(cid), discord.CategoryChannel):
@@ -366,12 +385,19 @@ class PanelAPI(commands.Cog):
         ticket = store.data["tickets"].get(request.match_info["tid"])
         if not ticket or ticket.get("guild") != guild.id:
             raise fail(404, "Тикет не найден")
-        if (await request.json()).get("action") != "close":
+        body = await request.json()
+        if body.get("action") != "close":
             raise fail(400, "Неизвестное действие")
         if ticket["status"] not in tickets.OPEN_STATUSES:
             raise fail(400, "Тикет уже завершён")
+        result = body.get("result")
+        if result not in ("accepted", "declined"):
+            raise fail(400, "Выберите итог: принят или отклонён")
+        reason = str(body.get("reason") or "").strip()
+        if not reason:
+            raise fail(400, "Укажите причину")
         # Taking a ticket needs the author's consent in Discord; the panel can only finish it
-        await tickets.close_ticket(self.bot, ticket, member)
+        await tickets.close_ticket(self.bot, ticket, member, result, reason)
         status = ticket["status"]
         return web.json_response({"status": status})
 
