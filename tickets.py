@@ -25,6 +25,12 @@ STATUS = {
     "cancelled": ("❌", "Отменен", 0x80848E),
 }
 OPEN_STATUSES = {"pending", "accepted"}
+# outcome chosen when finishing a ticket -> (emoji, label)
+RESULTS = {
+    "accepted": ("✅", "Принят"),
+    "declined": ("⛔", "Отклонён"),
+    "cancelled": ("↩️", "Отменён автором"),
+}
 DELETE_DELAY = 10          # seconds between "Завершить тикет" and deleting the channel
 TRANSCRIPT_LIMIT = 3000    # messages saved to the transcript file
 STEAM64_BASE = 76561197960265728
@@ -81,6 +87,52 @@ def plural_tickets(n: int) -> str:
     if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
         return "тикета"
     return "тикетов"
+
+
+def stars(n: int) -> str:
+    return "⭐" * n + "☆" * (5 - n)
+
+
+def result_text(ticket: dict) -> str:
+    """«Итог: Принят» + reason, for closed tickets."""
+    if ticket.get("result") not in RESULTS:
+        return ""
+    emoji, label = RESULTS[ticket["result"]]
+    text = f"**Итог:** {emoji} {label}"
+    if ticket.get("reason"):
+        text += f"\n**Причина:** {ticket['reason']}"
+    return text
+
+
+def speaker_stats(guild_id: int, since: int = 0) -> list[dict]:
+    """Per-speaker numbers for the panel: taken / results / rating / timings."""
+    per: dict[int, dict] = {}
+    for t in store.data["tickets"].values():
+        if t.get("guild") != guild_id or not t.get("speaker") or t["created"] < since:
+            continue
+        s = per.setdefault(t["speaker"], {"speaker": t["speaker"], "taken": 0, "open": 0, "accepted": 0,
+                                          "declined": 0, "cancelled": 0, "ratings": [], "response": [], "duration": []})
+        s["taken"] += 1
+        if t["status"] in OPEN_STATUSES:
+            s["open"] += 1
+        if t.get("result") in RESULTS:
+            s[t["result"]] += 1
+        if t.get("rating"):
+            s["ratings"].append(t["rating"])
+        if t.get("taken_at"):
+            s["response"].append(t["taken_at"] - t["created"])
+            if t.get("closed"):
+                s["duration"].append(t["closed"] - t["taken_at"])
+    avg = lambda xs: round(sum(xs) / len(xs), 2) if xs else None  # noqa: E731
+    result = []
+    for s in per.values():
+        result.append({
+            "speaker": s["speaker"], "taken": s["taken"], "open": s["open"], "accepted": s["accepted"],
+            "declined": s["declined"], "cancelled": s["cancelled"],
+            "rating": avg(s["ratings"]), "ratings": len(s["ratings"]),
+            "response": avg(s["response"]), "duration": avg(s["duration"]),
+        })
+    return sorted(result, key=lambda s: (-s["taken"], -(s["rating"] or 0)))
 
 
 def slug(text: str) -> str:
@@ -176,7 +228,7 @@ def ticket_view(ticket: dict) -> discord.ui.LayoutView:
         container.add_item(discord.ui.TextDisplay(f"✅ Тикет взял спикер <@{ticket['speaker']}>"))
     else:
         by = f" <@{ticket['closed_by']}>" if ticket.get("closed_by") else ""
-        container.add_item(discord.ui.TextDisplay(f"🔒 Тикет завершён{by}"))
+        container.add_item(discord.ui.TextDisplay(f"🔒 Тикет завершён{by}\n{result_text(ticket)}".rstrip()))
 
     note = ticket["note"].replace("```", "ʼʼʼ")
     container.add_item(discord.ui.TextDisplay(f"▪️ **Информация для спикера:**\n```\n{note}\n```"))
@@ -194,7 +246,7 @@ def ticket_view(ticket: dict) -> discord.ui.LayoutView:
 
     if status in OPEN_STATUSES:
         container.add_item(discord.ui.Separator())
-        buttons = [TakeTicketButton(ticket["id"])] if status == "pending" else []
+        buttons = [TakeTicketButton(ticket["id"]) if status == "pending" else TransferTicketButton(ticket["id"])]
         buttons.append(CloseTicketButton(ticket["id"]))
         container.add_item(discord.ui.ActionRow(*buttons))
     view = discord.ui.LayoutView(timeout=None)
@@ -232,7 +284,10 @@ def log_view(ticket: dict) -> discord.ui.LayoutView:
         status += f" · спикер <@{ticket['speaker']}>"
     if ticket["status"] == "closed" and ticket.get("closed_by"):
         status += f" · завершил <@{ticket['closed_by']}>"
-    container.add_item(discord.ui.TextDisplay(quote(status)))
+    extra = result_text(ticket)
+    if ticket.get("rating"):
+        extra += f"\n**Оценка спикера:** {stars(ticket['rating'])} ({ticket['rating']}/5)"
+    container.add_item(discord.ui.TextDisplay(quote(status) + (f"\n{extra.strip()}" if extra.strip() else "")))
     container.add_item(discord.ui.Separator())
     steam = f"`{ticket['steam64']}`" if ticket.get("steam64") else ticket["steam"]
     container.add_item(discord.ui.TextDisplay(
@@ -268,9 +323,41 @@ async def refresh_messages(client: discord.Client, ticket: dict) -> None:
                 log.warning("Ticket %s: cannot update %s: %s", ticket["id"], message_key, e)
 
 
+def log_thread(client: discord.Client, ticket: dict) -> discord.Thread | None:
+    thread = client.get_channel(ticket.get("log_thread") or 0)
+    return thread if isinstance(thread, discord.Thread) else None
+
+
+async def log_event(client: discord.Client, ticket: dict, text: str) -> None:
+    """A status line in the ticket's log thread (taken, finished, ...)."""
+    thread = log_thread(client, ticket)
+    if thread is None:
+        return
+    try:
+        await thread.send(view=note_view(text, STATUS[ticket["status"]][2]), allowed_mentions=NO_PINGS)
+    except discord.HTTPException as e:
+        log.warning("Ticket %s: cannot write to log thread: %s", ticket["id"], e)
+
+
+async def relay_to_log(client: discord.Client, ticket: dict, message: discord.Message) -> None:
+    """Copy a message from the ticket channel into the log thread as «username: text»."""
+    thread = log_thread(client, ticket)
+    if thread is None:
+        return
+    parts = [message.content, *(a.url for a in message.attachments), *(f"[стикер: {s.name}]" for s in message.stickers)]
+    body = "\n".join(p for p in parts if p)
+    if not body:
+        return
+    try:
+        await thread.send(clip(f"**{message.author.name}**: {body}", 2000), allowed_mentions=NO_PINGS)
+    except discord.HTTPException as e:
+        log.warning("Ticket %s: cannot relay message: %s", ticket["id"], e)
+
+
 async def save_transcript(client: discord.Client, ticket: dict, channel: discord.TextChannel) -> None:
-    logs = client.get_channel(ticket.get("log_channel") or 0)
-    if not isinstance(logs, discord.TextChannel):
+    thread = log_thread(client, ticket)
+    logs = thread or client.get_channel(ticket.get("log_channel") or 0)
+    if not isinstance(logs, (discord.TextChannel, discord.Thread)):
         return
     lines = [f"Тикет #{ticket['id']} · {GAMES[ticket['game']]['name']} · {ticket['username']} ({ticket['user']})",
              f"Steam: {ticket.get('steam64') or ticket['steam']}", ""]
@@ -280,35 +367,87 @@ async def save_transcript(client: discord.Client, ticket: dict, channel: discord
         lines.append(f"[{m.created_at:%d.%m.%Y %H:%M}] {m.author.name}: {text} {files}".rstrip())
     data = io.BytesIO("\n".join(lines).encode("utf-8"))
     try:
-        reference = logs.get_partial_message(ticket["log_message"]) if ticket.get("log_message") else None
+        reference = None
+        if thread is None and ticket.get("log_message"):
+            reference = logs.get_partial_message(ticket["log_message"])
         await logs.send(file=discord.File(data, filename=f"ticket-{ticket['id']}.txt"),
                         reference=reference, mention_author=False)
     except discord.HTTPException as e:
         log.warning("Ticket %s: cannot save transcript: %s", ticket["id"], e)
 
 
-async def close_ticket(client: discord.Client, ticket: dict, by: discord.abc.User) -> None:
+async def lock_log_thread(client: discord.Client, ticket: dict) -> None:
+    thread = log_thread(client, ticket)
+    if thread is not None:
+        try:
+            await thread.edit(archived=True, locked=True)
+        except discord.HTTPException as e:
+            log.warning("Ticket %s: cannot lock log thread: %s", ticket["id"], e)
+
+
+def rating_view(ticket: dict, rated: int | None = None) -> discord.ui.LayoutView:
+    """DM to the author asking to rate the speaker."""
+    game = GAMES[ticket["game"]]["name"]
+    container = discord.ui.Container(accent_color=0xF0B232)
+    container.add_item(discord.ui.TextDisplay(
+        f"### Оцените спикера\nТикет {game} #{ticket['id']} на сервере **{ticket.get('guild_name', '—')}** "
+        f"завершён. Как вам работа спикера <@{ticket['speaker']}>?\n{result_text(ticket)}".rstrip()))
+    if rated:
+        container.add_item(discord.ui.TextDisplay(f"Спасибо! Ваша оценка: {stars(rated)}"))
+    else:
+        container.add_item(discord.ui.ActionRow(*(RateButton(ticket["id"], n) for n in range(1, 6))))
+    view = discord.ui.LayoutView(timeout=None)
+    view.add_item(container)
+    return view
+
+
+async def ask_rating(client: discord.Client, ticket: dict) -> None:
+    if not ticket.get("speaker") or ticket.get("rating"):
+        return
+    try:
+        user = client.get_user(ticket["user"]) or await client.fetch_user(ticket["user"])
+        await user.send(view=rating_view(ticket))
+    except discord.HTTPException:
+        pass  # DMs closed
+
+
+async def close_ticket(client: discord.Client, ticket: dict, by: discord.abc.User,
+                       result: str | None = None, reason: str = "") -> None:
     """Mark the ticket finished, save the transcript and delete its channel after a short delay."""
     if ticket["status"] not in OPEN_STATUSES:
         return
+    if result not in RESULTS:
+        result = "cancelled" if by.id == ticket["user"] else None
     ticket["status"] = "closed"
     ticket["closed_by"] = by.id
     ticket["closed"] = int(discord.utils.utcnow().timestamp())
+    ticket["result"] = result
+    ticket["reason"] = clip(reason.strip(), 500)
     store.save()
     await refresh_messages(client, ticket)
 
+    summary = f"🔒 Тикет завершил **{by.name}**"
+    if result:
+        summary += f"\nИтог: {RESULTS[result][0]} {RESULTS[result][1]}"
+    if ticket["reason"]:
+        summary += f"\nПричина: {ticket['reason']}"
+    await log_event(client, ticket, summary)
+    await ask_rating(client, ticket)
+
     channel = client.get_channel(ticket.get("channel") or 0)
     if not isinstance(channel, discord.TextChannel):
+        await lock_log_thread(client, ticket)
         return
     try:
         await channel.send(view=note_view(
-            f"🔒 Тикет завершён {by.mention}. Канал будет удалён через {DELETE_DELAY} секунд.", 0x80848E),
-            allowed_mentions=NO_PINGS)
+            f"🔒 Тикет завершён {by.mention}.\n{result_text(ticket)}\n-# Канал будет удалён через {DELETE_DELAY} секунд.",
+            0x80848E), allowed_mentions=NO_PINGS)
     except discord.HTTPException:
         pass
 
     async def finish():
         await save_transcript(client, ticket, channel)
+        await lock_log_thread(client, ticket)
         await asyncio.sleep(DELETE_DELAY)
         try:
             await channel.delete(reason=f"Ticket #{ticket['id']} closed by {by}")
@@ -422,8 +561,14 @@ class TicketModal(discord.ui.Modal):
             try:
                 card = await logs.send(view=log_view(ticket), allowed_mentions=NO_PINGS)
                 ticket["log_channel"], ticket["log_message"] = logs.id, card.id
+                # Everything written in the ticket channel is copied into this thread
+                thread = await card.create_thread(
+                    name=clip(f"Тикет #{ticket_id} · {GAMES[self.game]['name']} · {user.name}", 100),
+                    auto_archive_duration=10080,
+                )
+                ticket["log_thread"] = thread.id
             except discord.HTTPException as e:
-                log.warning("Ticket %s: cannot post log card: %s", ticket_id, e)
+                log.warning("Ticket %s: cannot post log card / thread: %s", ticket_id, e)
 
         store.data["tickets"][str(ticket_id)] = ticket
         store.save()
@@ -456,6 +601,7 @@ class TakeTicketButton(discord.ui.DynamicItem[discord.ui.Button], template=r"tic
         await interaction.response.send_message(
             view=take_request_view(ticket, interaction.user.id),
             allowed_mentions=discord.AllowedMentions(users=[discord.Object(ticket["user"])], roles=False, everyone=False))
+        await log_event(interaction.client, ticket, f"🙋 Спикер **{interaction.user.name}** хочет взять тикет")
 
 
 class AgreeTakeButton(discord.ui.DynamicItem[discord.ui.Button],
@@ -478,10 +624,93 @@ class AgreeTakeButton(discord.ui.DynamicItem[discord.ui.Button],
             return await interaction.response.send_message(view=note_view("Тикет уже взят или завершён."), ephemeral=True)
         ticket["status"] = "accepted"
         ticket["speaker"] = self.speaker_id
+        ticket["taken_at"] = int(discord.utils.utcnow().timestamp())
         store.save()
         await interaction.response.edit_message(view=take_request_view(ticket, self.speaker_id, agreed=True),
                                                 allowed_mentions=NO_PINGS)
         await refresh_messages(interaction.client, ticket)
+        speaker = interaction.guild.get_member(self.speaker_id)
+        name = speaker.name if speaker else str(self.speaker_id)
+        await log_event(interaction.client, ticket, f"✅ Тикет взял спикер **{name}** (автор **{interaction.user.name}** согласился)")
+
+
+async def transfer_ticket(client: discord.Client, ticket: dict, by: discord.Member, target: discord.Member) -> None:
+    """Hand an accepted ticket over to another speaker (no author consent needed)."""
+    old = ticket.get("speaker")
+    ticket["speaker"] = target.id
+    ticket.setdefault("transfers", []).append({
+        "from": old, "to": target.id, "by": by.id, "at": int(discord.utils.utcnow().timestamp()),
+    })
+    store.save()
+
+    channel = client.get_channel(ticket.get("channel") or 0)
+    if isinstance(channel, discord.TextChannel):
+        try:
+            # make sure the new speaker sees the channel even without a speaker role overwrite
+            await channel.set_permissions(target, view_channel=True, send_messages=True, read_message_history=True,
+                                          attach_files=True, embed_links=True)
+            await channel.send(
+                view=note_view(f"🔁 <@{by.id}> передал тикет спикеру <@{target.id}>", 0x5865F2),
+                allowed_mentions=discord.AllowedMentions(users=[target], roles=False, everyone=False))
+        except discord.HTTPException as e:
+            log.warning("Ticket %s: transfer message failed: %s", ticket["id"], e)
+    await refresh_messages(client, ticket)
+    old_member = channel.guild.get_member(old) if isinstance(channel, discord.TextChannel) and old else None
+    old_name = old_member.name if old_member else (str(old) if old else "—")
+    await log_event(client, ticket, f"🔁 **{by.name}** передал тикет: **{old_name}** → **{target.name}**")
+
+
+class TransferPickView(discord.ui.LayoutView):
+    """Ephemeral picker: who gets the ticket."""
+
+    def __init__(self, ticket_id: int):
+        super().__init__(timeout=120)
+        self.ticket_id = ticket_id
+        self.select = discord.ui.UserSelect(placeholder="Выберите спикера", min_values=1, max_values=1)
+        self.select.callback = self.picked
+        self.add_item(discord.ui.Container(
+            discord.ui.TextDisplay(f"**Кому передать тикет #{ticket_id}?**\n"
+                                   "-# Нужна роль спикеров этой игры или роль администрации."),
+            discord.ui.ActionRow(self.select),
+        ))
+
+    async def picked(self, interaction: discord.Interaction):
+        ticket = store.data["tickets"].get(str(self.ticket_id))
+        if not ticket or ticket["status"] != "accepted":
+            return await interaction.response.edit_message(view=note_view("Тикет уже завершён."))
+        if interaction.user.id != ticket.get("speaker") and not is_staff(interaction.user):
+            return await interaction.response.edit_message(view=note_view("Передать тикет может только его спикер."))
+        target = self.select.values[0]
+        if not isinstance(target, discord.Member) or target.bot:
+            return await interaction.response.edit_message(view=note_view("Выберите участника сервера."))
+        if target.id == ticket["user"]:
+            return await interaction.response.edit_message(view=note_view("Нельзя передать тикет его автору."))
+        if target.id == ticket.get("speaker"):
+            return await interaction.response.edit_message(view=note_view("Этот спикер уже ведёт тикет."))
+        if not is_speaker(target, ticket):
+            return await interaction.response.edit_message(view=note_view(
+                f"У {target.mention} нет роли спикеров этой игры или администрации."))
+        await interaction.response.edit_message(view=note_view(f"✅ Тикет передан {target.mention}"))
+        await transfer_ticket(interaction.client, ticket, interaction.user, target)
+
+
+class TransferTicketButton(discord.ui.DynamicItem[discord.ui.Button], template=r"ticket:transfer:(?P<tid>\d+)"):
+    def __init__(self, ticket_id: int):
+        self.ticket_id = ticket_id
+        super().__init__(discord.ui.Button(label="Передать тикет", emoji="🔁", style=discord.ButtonStyle.secondary,
+                                           custom_id=f"ticket:transfer:{ticket_id}"))
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(int(match["tid"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        ticket = store.data["tickets"].get(str(self.ticket_id))
+        if not ticket or ticket["status"] != "accepted":
+            return await interaction.response.send_message(view=note_view("Передать можно только взятый тикет."), ephemeral=True)
+        if interaction.user.id != ticket.get("speaker") and not is_staff(interaction.user):
+            return await interaction.response.send_message(view=note_view("Передать тикет может только его спикер."), ephemeral=True)
+        await interaction.response.send_message(view=TransferPickView(self.ticket_id), ephemeral=True)
 
 
 class CloseTicketButton(discord.ui.DynamicItem[discord.ui.Button], template=r"ticket:close:(?P<tid>\d+)"):
@@ -498,10 +727,61 @@ class CloseTicketButton(discord.ui.DynamicItem[discord.ui.Button], template=r"ti
         ticket = store.data["tickets"].get(str(self.ticket_id))
         if not ticket or ticket["status"] not in OPEN_STATUSES:
             return await interaction.response.send_message(view=note_view("Тикет уже завершён."), ephemeral=True)
-        if interaction.user.id != ticket["user"] and not is_speaker(interaction.user, ticket):
+        speaker = is_speaker(interaction.user, ticket) and interaction.user.id != ticket["user"]
+        if interaction.user.id != ticket["user"] and not speaker:
             return await interaction.response.send_message(view=note_view("Недостаточно прав."), ephemeral=True)
+        # Speakers choose the outcome; the author only gives a reason (outcome: cancelled by author)
+        await interaction.response.send_modal(CloseTicketModal(self.ticket_id, with_result=speaker))
+
+
+class CloseTicketModal(discord.ui.Modal):
+    def __init__(self, ticket_id: int, with_result: bool):
+        super().__init__(title=f"Завершить тикет #{ticket_id}", timeout=None)
+        self.ticket_id = ticket_id
+        self.result: discord.ui.Select | None = None
+        if with_result:
+            self.result = discord.ui.Select(options=[
+                discord.SelectOption(label="Принят", value="accepted", emoji="✅"),
+                discord.SelectOption(label="Отклонён", value="declined", emoji="⛔"),
+            ], required=True)
+            self.add_item(discord.ui.Label(text="Итог", component=self.result))
+        self.reason = discord.ui.TextInput(
+            style=discord.TextStyle.paragraph, max_length=500, required=with_result,
+            placeholder="Почему принят / отклонён" if with_result else "Почему отменяете тикет (необязательно)",
+        )
+        self.add_item(discord.ui.Label(text="Причина", component=self.reason))
+
+    async def on_submit(self, interaction: discord.Interaction):
+        ticket = store.data["tickets"].get(str(self.ticket_id))
+        if not ticket or ticket["status"] not in OPEN_STATUSES:
+            return await interaction.response.send_message(view=note_view("Тикет уже завершён."), ephemeral=True)
+        result = self.result.values[0] if self.result and self.result.values else "cancelled"
         await interaction.response.defer()
-        await close_ticket(interaction.client, ticket, interaction.user)
+        await close_ticket(interaction.client, ticket, interaction.user, result, self.reason.value or "")
+
+
+class RateButton(discord.ui.DynamicItem[discord.ui.Button], template=r"ticket:rate:(?P<tid>\d+):(?P<n>[1-5])"):
+    def __init__(self, ticket_id: int, n: int):
+        self.ticket_id = ticket_id
+        self.n = n
+        super().__init__(discord.ui.Button(label=str(n), emoji="⭐", style=discord.ButtonStyle.secondary,
+                                           custom_id=f"ticket:rate:{ticket_id}:{n}"))
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(int(match["tid"]), int(match["n"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        ticket = store.data["tickets"].get(str(self.ticket_id))
+        if not ticket or interaction.user.id != ticket["user"]:
+            return await interaction.response.send_message(view=note_view("Это не ваш тикет."), ephemeral=True)
+        if ticket.get("rating"):
+            return await interaction.response.edit_message(view=rating_view(ticket, ticket["rating"]))
+        ticket["rating"] = self.n
+        ticket["rated_at"] = int(discord.utils.utcnow().timestamp())
+        store.save()
+        await interaction.response.edit_message(view=rating_view(ticket, self.n))
+        await refresh_messages(interaction.client, ticket)  # shows the rating on the log card
 
 
 # ---------- cog ----------
@@ -527,14 +807,25 @@ class Tickets(commands.Cog):
         store.save()
 
     @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        if message.guild is None or message.author.bot:
+            return
+        ticket = ticket_by_channel(message.channel.id)
+        if ticket and ticket.get("log_thread"):
+            await relay_to_log(self.bot, ticket, message)
+
+    @commands.Cog.listener()
     async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel):
         ticket = ticket_by_channel(channel.id)
         if ticket and ticket["status"] in OPEN_STATUSES:
             ticket["status"] = "closed"
             store.save()
             await refresh_messages(self.bot, ticket)
+            await log_event(self.bot, ticket, "🗑️ Канал тикета удалили вручную")
+            await lock_log_thread(self.bot, ticket)
 
 
 async def setup(bot: commands.Bot):
-    bot.add_dynamic_items(OpenTicketButton, TakeTicketButton, AgreeTakeButton, CloseTicketButton)
+    bot.add_dynamic_items(OpenTicketButton, TakeTicketButton, AgreeTakeButton, TransferTicketButton,
+                          CloseTicketButton, RateButton)
     await bot.add_cog(Tickets(bot))
