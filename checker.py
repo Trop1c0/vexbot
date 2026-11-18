@@ -332,6 +332,33 @@ def price_text(g: dict, mode: str) -> str:
     return money(value or 0)
 
 
+SOURCE_NOTES = {"lzt": "Цены LZT Market (USD)", "steam": "Цены Steam Community Market (lowest price, USD)",
+                "both": "Цены Steam Community Market и LZT Market (USD)"}
+
+
+def inventory_rows(guild_id: int, games: dict[str, dict], mode: str) -> list[str]:
+    """«Общая стоимость инвентаря» + one line per game — shared by the checker and ticket messages."""
+    steam_total = sum(g.get("steam") or 0 for g in games.values())
+    lzt_total = sum(g.get("lzt") or 0 for g in games.values())
+    if mode == "both":
+        rows = [f"▪️ **Общая стоимость инвентаря:** {money(steam_total)} (Steam) · {money(lzt_total)} (LZT)"]
+    elif mode == "lzt":
+        rows = [f"▪️ **Общая стоимость инвентаря: {money(lzt_total)}** (LZT PRICE)"]
+    else:
+        rows = [f"▪️ **Общая стоимость инвентаря: {money(steam_total)}** (STEAM PRICE)"]
+    for key, g in games.items():
+        head = f"{game_emoji(guild_id, key)} {GAMES[key]['name']}:"
+        if g["status"] == "private":
+            rows.append(f"{head} 🔒 инвентарь скрыт")
+        elif g["status"] == "ratelimit":
+            rows.append(f"{head} ⏳ слишком много запросов, попробуйте позже")
+        elif g["status"] == "error":
+            rows.append(f"{head} ⚠️ {g.get('message') or 'не удалось загрузить'}")
+        else:
+            rows.append(f"{head} {price_text(g, mode)} (tradable {g['tradable']} / nontradable: {g['nontradable']})")
+    return rows
+
+
 def result_view(guild_id: int, steam64: str, summary: dict | None, faceit: dict | None,
                 games: dict[str, dict], unpriced: int, requested_by: str, mode: str = "steam") -> discord.ui.LayoutView:
     lines = []
@@ -360,28 +387,8 @@ def result_view(guild_id: int, steam64: str, summary: dict | None, faceit: dict 
         else:
             lines.append("▪️ **FACEIT Profile:** не найден")
 
-    steam_total = sum(g.get("steam") or 0 for g in games.values())
-    lzt_total = sum(g.get("lzt") or 0 for g in games.values())
-    if mode == "both":
-        rows = [f"▪️ **Общая стоимость инвентаря:** {money(steam_total)} (Steam) · {money(lzt_total)} (LZT)"]
-    elif mode == "lzt":
-        rows = [f"▪️ **Общая стоимость инвентаря: {money(lzt_total)}** (LZT PRICE)"]
-    else:
-        rows = [f"▪️ **Общая стоимость инвентаря: {money(steam_total)}** (STEAM PRICE)"]
-    for key, g in games.items():
-        head = f"{game_emoji(guild_id, key)} {GAMES[key]['name']}:"
-        if g["status"] == "private":
-            rows.append(f"{head} 🔒 инвентарь скрыт")
-        elif g["status"] == "ratelimit":
-            rows.append(f"{head} ⏳ слишком много запросов, попробуйте позже")
-        elif g["status"] == "error":
-            rows.append(f"{head} ⚠️ {g.get('message') or 'не удалось загрузить'}")
-        else:
-            rows.append(f"{head} {price_text(g, mode)} (tradable {g['tradable']} / nontradable {g['nontradable']})")
-
-    source = {"lzt": "Цены LZT Market (USD)", "steam": "Цены Steam Community Market (lowest price, USD)",
-              "both": "Цены Steam Community Market и LZT Market (USD)"}[mode]
-    footer = f"-# {source} · запросил {requested_by}"
+    rows = inventory_rows(guild_id, games, mode)
+    footer = f"-# {SOURCE_NOTES[mode]} · запросил {requested_by}"
     if unpriced:
         footer += f"\n-# Без цены пока {unpriced} предм. — Steam отдаёт цены медленно, повторная проверка их досчитает."
 
@@ -444,18 +451,39 @@ class Checker(commands.Cog):
             await reply.edit(view=status_view("❌ Не удалось определить SteamID. Проверьте ссылку."))
             return
 
-        source = store.settings(message.guild.id)["checker_source"]
+        async def progress(text: str):
+            await reply.edit(view=status_view(text))
+
+        result = await self.evaluate(steam64, message.guild.id, progress)
+        await reply.edit(view=result_view(message.guild.id, steam64, result["summary"], result["faceit"],
+                                          result["games"], result["unpriced"], message.author.name, result["mode"]),
+                         allowed_mentions=NO_PINGS)
+
+    async def evaluate(self, steam64: str, guild_id: int, progress=None, with_profile: bool = True) -> dict:
+        """Profile + inventory value of one account. Used by the checker channel and by new tickets.
+
+        Returns {"summary", "faceit", "games", "unpriced", "mode"}; progress(text) gets status updates."""
+        async def say(text: str):
+            if progress:
+                try:
+                    await progress(text)
+                except discord.HTTPException:
+                    pass
+
+        source = store.settings(guild_id)["checker_source"]
         use_lzt = source in ("lzt", "both") and bool(config.LZT_API_TOKEN)
         use_steam = source in ("steam", "both") or not use_lzt
+        summary = faceit = None
 
         async with self.slots:
-            await reply.edit(view=status_view("⏳ Загружаю профиль…"))
-            summary, faceit = await asyncio.gather(self.steam.summary(steam64), self.steam.faceit(steam64))
+            if with_profile:
+                await say("⏳ Загружаю профиль…")
+                summary, faceit = await asyncio.gather(self.steam.summary(steam64), self.steam.faceit(steam64))
 
             lzt: dict[str, dict] = {}
             if use_lzt:
                 for n, (key, (appid, _)) in enumerate(INVENTORIES.items(), 1):
-                    await reply.edit(view=status_view(f"⏳ Считаю инвентарь по ценам LZT: {GAMES[key]['name']} ({n}/4)"))
+                    await say(f"⏳ Считаю инвентарь по ценам LZT: {GAMES[key]['name']} ({n}/4)")
                     lzt[key] = await self.lzt.value(steam64, appid)
                 if source == "lzt" and all(r["status"] in ("error", "ratelimit") for r in lzt.values()):
                     log.warning("LZT failed for every game (%s), falling back to Steam prices",
@@ -465,10 +493,10 @@ class Checker(commands.Cog):
             inventories: dict[str, dict] = {}
             unpriced = 0
             if use_steam:
-                await reply.edit(view=status_view("⏳ Загружаю инвентари Steam…"))
+                await say("⏳ Загружаю инвентари Steam…")
                 inventories = {key: await self.steam.inventory(steam64, appid, ctx)
                                for key, (appid, ctx) in INVENTORIES.items()}
-                await self.fetch_prices(reply, inventories)
+                await self.fetch_prices(say, inventories)
 
         mode = "both" if (use_lzt and use_steam) else ("lzt" if use_lzt else "steam")
         games = {}
@@ -488,10 +516,9 @@ class Checker(commands.Cog):
                 g["status"] = failed.get("status", "error")
                 g["message"] = failed.get("message")
             games[key] = g
-        await reply.edit(view=result_view(message.guild.id, steam64, summary, faceit, games, unpriced,
-                                          message.author.name, mode), allowed_mentions=NO_PINGS)
+        return {"summary": summary, "faceit": faceit, "games": games, "unpriced": unpriced, "mode": mode}
 
-    async def fetch_prices(self, reply: discord.Message, inventories: dict[str, dict]) -> None:
+    async def fetch_prices(self, say, inventories: dict[str, dict]) -> None:
         """Steam Market prices: cached ones are free, new ones go through the rate-limited queue."""
         needed = []
         for key, inv in inventories.items():
@@ -503,7 +530,7 @@ class Checker(commands.Cog):
         for n, (appid, name) in enumerate(lookups, 1):
             if n == 1 or n % 8 == 0:
                 eta = int((len(lookups) - n) * PRICE_GAP)
-                await reply.edit(view=status_view(f"⏳ Узнаю цены Steam Market: {n}/{len(lookups)} · ещё ~{eta} сек."))
+                await say(f"⏳ Узнаю цены Steam Market: {n}/{len(lookups)} · ещё ~{eta} сек.")
             try:
                 self.prices.set(appid, name, await self.steam.price(appid, name))
             except RateLimited:

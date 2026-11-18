@@ -5,7 +5,7 @@ import re
 
 import aiohttp
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 import config
 from config import GAMES
@@ -25,6 +25,11 @@ STATUS = {
     "cancelled": ("❌", "Отменен", 0x80848E),
 }
 OPEN_STATUSES = {"pending", "accepted"}
+# deal type chosen in the ticket form -> (label, emoji, hint in the select)
+DEALS = {
+    "mfile": ("MFILE", "📁", "Сделка через MFILE"),
+    "trade": ("Trade", "🔄", "Сделка через трейд"),
+}
 # outcome chosen when finishing a ticket -> (emoji, label)
 RESULTS = {
     "accepted": ("✅", "Принят"),
@@ -87,6 +92,11 @@ def plural_tickets(n: int) -> str:
     if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
         return "тикета"
     return "тикетов"
+
+
+def deal_label(ticket: dict) -> str:
+    deal = DEALS.get(ticket.get("deal") or "")
+    return f"{deal[1]} {deal[0]}" if deal else "—"
 
 
 def stars(n: int) -> str:
@@ -168,6 +178,67 @@ def previous_tickets(ticket: dict) -> int:
                if t.get("steam64") == ticket["steam64"] and t.get("guild") == ticket["guild"] and t["id"] != ticket["id"])
 
 
+def previous_list(ticket: dict, limit: int = 3) -> list[dict]:
+    """Latest earlier tickets with the same SteamID on this server (snapshot stored in the ticket)."""
+    if not ticket.get("steam64"):
+        return []
+    same = sorted((t for t in store.data["tickets"].values()
+                   if t.get("steam64") == ticket["steam64"] and t.get("guild") == ticket["guild"]
+                   and t["id"] != ticket["id"]), key=lambda t: t["id"], reverse=True)[:limit]
+    return [{
+        "id": t["id"], "created": t["created"], "status": t["status"], "result": t.get("result"),
+        "speaker": t.get("speaker"), "user": t["user"], "deal": t.get("deal"),
+        "log_url": f"https://discord.com/channels/{t['guild']}/{t['log_thread']}" if t.get("log_thread") else None,
+    } for t in same]
+
+
+def previous_line(p: dict) -> str:
+    if p["status"] == "closed" and p.get("result") in RESULTS:
+        outcome = " ".join(RESULTS[p["result"]])
+    else:
+        outcome = f"{STATUS.get(p['status'], ('', p['status']))[0]} {STATUS.get(p['status'], ('', p['status']))[1]}"
+    parts = [f"#{p['id']}", f"<t:{p['created']}:d>", outcome]
+    if p.get("deal") in DEALS:
+        parts.append(DEALS[p["deal"]][0])
+    if p.get("user"):
+        parts.append(f"автор <@{p['user']}>")
+    if p.get("speaker"):
+        parts.append(f"спикер <@{p['speaker']}>")
+    if p.get("log_url"):
+        parts.append(f"[лог]({p['log_url']})")
+    return "-# " + " · ".join(parts)
+
+
+def inventory_text(ticket: dict) -> str:
+    """Inventory value block of a ticket (auto check)."""
+    inv = ticket.get("inventory")
+    if not inv:
+        return ""
+    if inv["state"] == "loading":
+        return "⏳ Проверяю инвентарь…"
+    if inv["state"] == "error":
+        return "⚠️ Не удалось проверить инвентарь — используйте канал чекера."
+    from checker import inventory_rows  # local import: checker imports this module
+    return "\n".join(inventory_rows(ticket["guild"], inv["games"], inv["mode"]))
+
+
+async def auto_check(client: discord.Client, ticket: dict) -> None:
+    """Fills the inventory block of a new ticket in the background."""
+    checker = client.get_cog("Checker")
+    if checker is None:
+        ticket["inventory"] = None
+    else:
+        try:
+            result = await checker.evaluate(ticket["steam64"], ticket["guild"], with_profile=False)
+            ticket["inventory"] = {"state": "done", "games": result["games"], "mode": result["mode"],
+                                   "checked": int(discord.utils.utcnow().timestamp())}
+        except Exception:
+            log.exception("Ticket %s: inventory check failed", ticket["id"])
+            ticket["inventory"] = {"state": "error"}
+    store.save()
+    await refresh_messages(client, ticket)
+
+
 # ---------- panel ----------
 
 def panel_view(banner: str | None, settings: dict) -> discord.ui.LayoutView:
@@ -231,7 +302,8 @@ def ticket_view(ticket: dict) -> discord.ui.LayoutView:
         container.add_item(discord.ui.TextDisplay(f"🔒 Тикет завершён{by}\n{result_text(ticket)}".rstrip()))
 
     note = ticket["note"].replace("```", "ʼʼʼ")
-    container.add_item(discord.ui.TextDisplay(f"▪️ **Информация для спикера:**\n```\n{note}\n```"))
+    container.add_item(discord.ui.TextDisplay(
+        f"▪️ **Тип сделки:** {deal_label(ticket)}\n▪️ **Информация для спикера:**\n```\n{note}\n```"))
 
     if ticket.get("steam64"):
         steam = (f"**Steam ID64:** `{ticket['steam64']}` · "
@@ -240,7 +312,14 @@ def ticket_view(ticket: dict) -> discord.ui.LayoutView:
         verb = "найден" if plural_tickets(count) == "тикет" else "найдено"
         found = (f"🟥 С этим SteamID {verb} {count} {plural_tickets(count)}" if count
                  else "🟩 С этим SteamID тикетов ещё не было")
-        container.add_item(discord.ui.TextDisplay(f"{steam}\n{found}"))
+        history = "".join(f"\n{previous_line(p)}" for p in ticket.get("previous_list", []))
+        if count > len(ticket.get("previous_list", [])):
+            history += f"\n-# …и ещё {count - len(ticket['previous_list'])} — все в панели, поиск по SteamID"
+        container.add_item(discord.ui.TextDisplay(f"{steam}\n{found}{history}"))
+        inventory = inventory_text(ticket)
+        if inventory:
+            container.add_item(discord.ui.Separator())
+            container.add_item(discord.ui.TextDisplay(inventory))
     else:
         container.add_item(discord.ui.TextDisplay(f"**Steam:** {ticket['steam']}\n-# SteamID64 определить не удалось"))
 
@@ -290,11 +369,18 @@ def log_view(ticket: dict) -> discord.ui.LayoutView:
     container.add_item(discord.ui.TextDisplay(quote(status) + (f"\n{extra.strip()}" if extra.strip() else "")))
     container.add_item(discord.ui.Separator())
     steam = f"`{ticket['steam64']}`" if ticket.get("steam64") else ticket["steam"]
-    container.add_item(discord.ui.TextDisplay(
-        f"**Пользователь:** <@{ticket['user']}> (`{ticket['username']}`, `{ticket['user']}`)\n"
-        f"**Steam:** {steam}\n"
-        f"**Информация для спикера:**\n{quote(ticket['note'])}"
-    ))
+    if ticket.get("previous"):
+        steam += f" · тикетов с этим SteamID раньше: **{ticket['previous']}**"
+    lines = [
+        f"**Пользователь:** <@{ticket['user']}> (`{ticket['username']}`, `{ticket['user']}`)",
+        f"**Тип сделки:** {deal_label(ticket)}",
+        f"**Steam:** {steam}",
+    ]
+    inventory = inventory_text(ticket)
+    if inventory:
+        lines.append(inventory.splitlines()[0])  # just the total on the card
+    lines.append(f"**Информация для спикера:**\n{quote(ticket['note'])}")
+    container.add_item(discord.ui.TextDisplay("\n".join(lines)))
     container.add_item(discord.ui.TextDisplay(f"-# Создан <t:{ticket['created']}:f>"))
     view = discord.ui.LayoutView(timeout=None)
     view.add_item(container)
@@ -359,7 +445,8 @@ async def save_transcript(client: discord.Client, ticket: dict, channel: discord
     logs = thread or client.get_channel(ticket.get("log_channel") or 0)
     if not isinstance(logs, (discord.TextChannel, discord.Thread)):
         return
-    lines = [f"Тикет #{ticket['id']} · {GAMES[ticket['game']]['name']} · {ticket['username']} ({ticket['user']})",
+    lines = [f"Тикет #{ticket['id']} · {GAMES[ticket['game']]['name']} · {DEALS.get(ticket.get('deal') or '', ('—',))[0]}"
+             f" · {ticket['username']} ({ticket['user']})",
              f"Steam: {ticket.get('steam64') or ticket['steam']}", ""]
     async for m in channel.history(limit=TRANSCRIPT_LIMIT, oldest_first=True):
         text = m.content or ("[сообщение бота]" if m.author.bot else "")
@@ -490,6 +577,10 @@ class TicketModal(discord.ui.Modal):
     def __init__(self, game: str):
         super().__init__(title=f"Тикет {GAMES[game]['name']}", timeout=None)
         self.game = game
+        self.deal = discord.ui.Select(placeholder="Выберите тип", required=True, options=[
+            discord.SelectOption(label=label, value=key, emoji=emoji, description=hint)
+            for key, (label, emoji, hint) in DEALS.items()
+        ])
         self.steam = discord.ui.TextInput(
             placeholder="https://steamcommunity.com/profiles/...", max_length=200, required=True,
         )
@@ -497,6 +588,7 @@ class TicketModal(discord.ui.Modal):
             style=discord.TextStyle.paragraph, placeholder="RU/EU, где нашел? о чем договорился?",
             max_length=1000, required=True,
         )
+        self.add_item(discord.ui.Label(text="Тип сделки", component=self.deal))
         self.add_item(discord.ui.Label(text="Steam ссылка или SteamID", component=self.steam))
         self.add_item(discord.ui.Label(text="Примечание для спикера", component=self.note))
 
@@ -518,12 +610,16 @@ class TicketModal(discord.ui.Modal):
         ticket = {
             "id": ticket_id, "guild": guild.id, "guild_name": guild.name, "game": self.game,
             "user": user.id, "username": user.name,
+            "deal": self.deal.values[0] if self.deal.values and self.deal.values[0] in DEALS else None,
             "steam": clip(self.steam.value.strip(), 200), "note": clip(self.note.value.strip(), 1000),
             "status": "pending", "speaker": None, "closed_by": None,
             "created": int(discord.utils.utcnow().timestamp()),
         }
         ticket["steam64"] = await resolve_steam64(ticket["steam"])
         ticket["previous"] = previous_tickets(ticket)
+        ticket["previous_list"] = previous_list(ticket)
+        check_inventory = bool(settings["auto_check"] and ticket["steam64"] and interaction.client.get_cog("Checker"))
+        ticket["inventory"] = {"state": "loading"} if check_inventory else None
 
         # Visible to the author, staff, this game's speakers and the bot
         allow = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True,
@@ -541,7 +637,7 @@ class TicketModal(discord.ui.Modal):
         try:
             channel = await guild.create_text_channel(
                 name=slug(f"{self.game}-{user.name}")[:90], category=category, overwrites=overwrites,
-                topic=f"Тикет #{ticket_id} · {GAMES[self.game]['name']} · {user} ({user.id})",
+                topic=f"Тикет #{ticket_id} · {GAMES[self.game]['name']} · {deal_label(ticket)} · {user} ({user.id})",
                 reason=f"Ticket #{ticket_id} by {user}",
             )
         except discord.Forbidden:
@@ -573,6 +669,8 @@ class TicketModal(discord.ui.Modal):
         store.data["tickets"][str(ticket_id)] = ticket
         store.save()
         await interaction.followup.send(view=note_view(f"✅ Тикет создан: {channel.mention}"), ephemeral=True)
+        if check_inventory:
+            asyncio.create_task(auto_check(interaction.client, ticket))
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
         log.exception("Ticket modal failed", exc_info=error)
@@ -790,6 +888,49 @@ class Tickets(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
+    async def cog_load(self):
+        self.reminders.start()
+
+    async def cog_unload(self):
+        self.reminders.cancel()
+
+    @tasks.loop(seconds=60)
+    async def reminders(self):
+        """Ping a role while a ticket waits for a speaker (per-server interval / role / limit)."""
+        now = int(discord.utils.utcnow().timestamp())
+        for ticket in list(store.data["tickets"].values()):
+            if ticket["status"] != "pending" or not ticket.get("guild"):
+                continue
+            settings = store.settings(ticket["guild"])
+            if not settings["reminder_enabled"]:
+                continue
+            sent = ticket.get("reminders", 0)
+            if settings["reminder_max"] and sent >= settings["reminder_max"]:
+                continue
+            interval = max(settings["reminder_minutes"], 1) * 60
+            if now - (ticket.get("last_reminder") or ticket["created"]) < interval:
+                continue
+            channel = self.bot.get_channel(ticket.get("channel") or 0)
+            if not isinstance(channel, discord.TextChannel):
+                continue
+            role = settings["reminder_role"] or game_role(ticket)
+            who = f"<@&{role}>" if role else "Спикеры"
+            waited = (now - ticket["created"]) // 60
+            ticket["reminders"] = sent + 1
+            ticket["last_reminder"] = now
+            store.save()
+            try:
+                await channel.send(
+                    view=note_view(f"⏰ {who}, тикет #{ticket['id']} ждёт спикера уже {waited} мин.", 0xF0B232),
+                    allowed_mentions=discord.AllowedMentions(roles=[discord.Object(role)] if role else [],
+                                                             users=False, everyone=False))
+            except discord.HTTPException as e:
+                log.warning("Ticket %s: reminder failed: %s", ticket["id"], e)
+
+    @reminders.before_loop
+    async def before_reminders(self):
+        await self.bot.wait_until_ready()
+
     @commands.Cog.listener()
     async def on_vex_startup(self):
         # Re-post panels that were deleted while the bot was offline
@@ -804,6 +945,9 @@ class Tickets(commands.Cog):
                     and self.bot.get_guild(ticket.get("guild") or 0):
                 ticket["status"] = "closed"
                 await refresh_messages(self.bot, ticket)
+            # inventory checks interrupted by a restart
+            elif ticket["status"] in OPEN_STATUSES and (ticket.get("inventory") or {}).get("state") == "loading":
+                asyncio.create_task(auto_check(self.bot, ticket))
         store.save()
 
     @commands.Cog.listener()

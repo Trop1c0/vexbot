@@ -152,6 +152,11 @@ class PanelAPI(commands.Cog):
             "member_logs_channel": sid(settings["member_logs_channel"]),
             "checker_channel": sid(settings["checker_channel"]),
             "checker_source": settings["checker_source"],
+            "auto_check": settings["auto_check"],
+            "reminder_enabled": settings["reminder_enabled"],
+            "reminder_minutes": settings["reminder_minutes"],
+            "reminder_role": sid(settings["reminder_role"]),
+            "reminder_max": settings["reminder_max"],
             "log_joins": settings["log_joins"], "log_leaves": settings["log_leaves"],
             "staff_roles": [str(r) for r in settings["staff_roles"]],
             "banner_url": settings["banner_url"],
@@ -205,6 +210,7 @@ class PanelAPI(commands.Cog):
             "panel": {"channel": sid(panel["channel"]), "url": f"https://discord.com/channels/{guild.id}/{panel['channel']}/{panel['message']}"} if panel else None,
             "tickets": [{
                 "id": t["id"], "game": GAMES[t["game"]]["name"], "user": str(t["user"]), "username": t["username"],
+                "deal": tickets.DEALS[t["deal"]][0] if t.get("deal") in tickets.DEALS else None,
                 "status": t["status"], "created": t["created"],
                 "channel_url": t.get("channel_url") if t["status"] in tickets.OPEN_STATUSES else None,
                 "log_url": f"https://discord.com/channels/{guild.id}/{t['log_thread']}" if t.get("log_thread") else None,
@@ -244,6 +250,24 @@ class PanelAPI(commands.Cog):
                 if cid and not isinstance(guild.get_channel(cid), discord.TextChannel):
                     raise fail(400, "Канал не найден на сервере")
                 settings[key] = cid
+        for key in ("auto_check", "reminder_enabled"):
+            if key in body:
+                settings[key] = bool(body[key])
+        for key, low, high, title in (("reminder_minutes", 5, 1440, "Интервал напоминаний"),
+                                      ("reminder_max", 0, 100, "Лимит напоминаний")):
+            if key in body:
+                try:
+                    value = int(body[key])
+                except (TypeError, ValueError):
+                    raise fail(400, f"{title}: нужно число")
+                if not low <= value <= high:
+                    raise fail(400, f"{title}: от {low} до {high}")
+                settings[key] = value
+        if "reminder_role" in body:
+            role = parse_id(body["reminder_role"])
+            if role and guild.get_role(role) is None:
+                raise fail(400, "Роль для напоминаний не найдена")
+            settings["reminder_role"] = role
         if "checker_source" in body:
             if body["checker_source"] not in ("lzt", "steam", "both"):
                 raise fail(400, "Неизвестный источник цен")

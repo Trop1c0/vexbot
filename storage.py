@@ -12,6 +12,11 @@ def default_settings() -> dict:
         "member_logs_channel": None,  # join / leave logs
         "checker_channel": None,      # Steam inventory checker
         "checker_source": "lzt",      # inventory prices: lzt | steam | both (lzt falls back to steam)
+        "auto_check": True,           # check the author's inventory right in a new ticket
+        "reminder_enabled": False,    # ping while a ticket is not taken
+        "reminder_minutes": 30,
+        "reminder_role": None,        # None = speakers role of the ticket's game
+        "reminder_max": 0,            # 0 = no limit
         "log_joins": True,
         "log_leaves": True,
         "staff_roles": [],
