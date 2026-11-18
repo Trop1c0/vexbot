@@ -333,6 +333,22 @@ def ticket_view(ticket: dict) -> discord.ui.LayoutView:
     return view
 
 
+def speaker_summary(guild_id: int, speaker_id: int) -> str:
+    """«Взял тикетов: 21 (✅ 15 / ⛔ 4) · Рейтинг: ⭐⭐⭐⭐⭐ 4.7 (17 оценок)» for this server, all time."""
+    stats = next((s for s in speaker_stats(guild_id) if s["speaker"] == speaker_id), None)
+    if not stats:
+        return "-# 🆕 Новый спикер: ещё не брал тикеты на этом сервере"
+    line = f"▪️ **Взял тикетов:** {stats['taken']} (✅ {stats['accepted']} / ⛔ {stats['declined']})"
+    if stats["rating"]:
+        n = stats["ratings"]
+        word = "оценка" if n % 10 == 1 and n % 100 != 11 else (
+            "оценки" if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14 else "оценок")
+        line += f"\n▪️ **Рейтинг:** {stars(round(stats['rating']))} {stats['rating']:.1f} ({n} {word})"
+    else:
+        line += "\n▪️ **Рейтинг:** пока нет оценок"
+    return line
+
+
 def take_request_view(ticket: dict, speaker_id: int, agreed: bool = False) -> discord.ui.LayoutView:
     container = discord.ui.Container(accent_color=0x23A55A if agreed else None)
     if agreed:
@@ -340,7 +356,8 @@ def take_request_view(ticket: dict, speaker_id: int, agreed: bool = False) -> di
             f"✅ <@{ticket['user']}> согласился. Тикет взял спикер <@{speaker_id}>"))
     else:
         container.add_item(discord.ui.TextDisplay(
-            f"<@{ticket['user']}> ваш тикет хочет взять спикер <@{speaker_id}>"))
+            f"<@{ticket['user']}> ваш тикет хочет взять спикер <@{speaker_id}>\n"
+            f"{speaker_summary(ticket['guild'], speaker_id)}"))
         container.add_item(discord.ui.ActionRow(AgreeTakeButton(ticket["id"], speaker_id)))
     view = discord.ui.LayoutView(timeout=None)
     view.add_item(container)
