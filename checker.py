@@ -18,6 +18,7 @@ import config
 import tickets
 from config import GAMES
 from storage import store
+import leaderboard as lb
 
 log = logging.getLogger("vex.checker")
 
@@ -458,6 +459,12 @@ class Checker(commands.Cog):
         await reply.edit(view=result_view(message.guild.id, steam64, result["summary"], result["faceit"],
                                           result["games"], result["unpriced"], message.author.name, result["mode"]),
                          allowed_mentions=NO_PINGS)
+        
+        # Track worker activity (inventory check)
+        lb.track_worker_inventory_check(message.guild.id, message.author.id)
+        
+        # Refresh workers leaderboard
+        asyncio.create_task(lb.refresh_workers_panel(self.bot, message.guild.id))
 
     async def evaluate(self, steam64: str, guild_id: int, progress=None, with_profile: bool = True) -> dict:
         """Profile + inventory value of one account. Used by the checker channel and by new tickets.

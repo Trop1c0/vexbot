@@ -10,6 +10,7 @@ from discord.ext import commands, tasks
 import config
 from config import GAMES
 from storage import store
+import leaderboard as lb
 
 log = logging.getLogger("vex.tickets")
 
@@ -684,10 +685,17 @@ class TicketModal(discord.ui.Modal):
                 log.warning("Ticket %s: cannot post log card / thread: %s", ticket_id, e)
 
         store.data["tickets"][str(ticket_id)] = ticket
+        
+        # Track worker activity (ticket created)
+        lb.track_worker_created_ticket(guild.id, user.id)
+        
         store.save()
         await interaction.followup.send(view=note_view(f"✅ Тикет создан: {channel.mention}"), ephemeral=True)
         if check_inventory:
             asyncio.create_task(auto_check(interaction.client, ticket))
+        
+        # Refresh workers leaderboard
+        asyncio.create_task(lb.refresh_workers_panel(interaction.client, guild.id))
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
         log.exception("Ticket modal failed", exc_info=error)
@@ -740,6 +748,10 @@ class AgreeTakeButton(discord.ui.DynamicItem[discord.ui.Button],
         ticket["status"] = "accepted"
         ticket["speaker"] = self.speaker_id
         ticket["taken_at"] = int(discord.utils.utcnow().timestamp())
+        
+        # Track speaker activity
+        lb.track_speaker_took_ticket(ticket["guild"], self.speaker_id)
+        
         store.save()
         await interaction.response.edit_message(view=take_request_view(ticket, self.speaker_id, agreed=True),
                                                 allowed_mentions=NO_PINGS)
@@ -747,6 +759,9 @@ class AgreeTakeButton(discord.ui.DynamicItem[discord.ui.Button],
         speaker = interaction.guild.get_member(self.speaker_id)
         name = speaker.name if speaker else str(self.speaker_id)
         await log_event(interaction.client, ticket, f"✅ Тикет взял спикер **{name}** (автор **{interaction.user.name}** согласился)")
+        
+        # Refresh speakers leaderboard
+        asyncio.create_task(lb.refresh_speakers_panel(interaction.client, ticket["guild"]))
 
 
 async def transfer_ticket(client: discord.Client, ticket: dict, by: discord.Member, target: discord.Member) -> None:

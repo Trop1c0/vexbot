@@ -24,6 +24,11 @@ def default_settings() -> dict:
         "banner_file": None,          # uploaded file name in data/banners
         # role: speakers of this game, pinged in new tickets and allowed to take them
         "games": {key: {"enabled": True, "emoji": "", "role": None} for key in GAMES},
+        # leaderboard settings
+        "speakers_leaderboard_channel": None,  # channel for speakers leaderboard panel
+        "workers_leaderboard_channel": None,   # channel for workers leaderboard panel
+        "speaker_role": None,                  # role for speakers leaderboard filter
+        "worker_role": None,                   # role for workers leaderboard filter
     }
 
 
@@ -39,6 +44,7 @@ class Store:
             "next_ticket": 1,
             "join_channels": [],   # "join to create" voice channel ids
             "temp_channels": {},   # created voice channel id -> owner / state
+            "daily_stats": {},     # guild id -> date -> {speakers, workers}
         }
         if path.exists():
             self.data.update(json.loads(path.read_text(encoding="utf-8")))
