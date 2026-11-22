@@ -12,6 +12,7 @@ def default_settings() -> dict:
         "member_logs_channel": None,  # join / leave logs
         "checker_channel": None,      # Steam inventory checker
         "checker_source": "lzt",      # inventory prices: lzt | steam | both (lzt falls back to steam)
+        "checker_hint": "Пришлите ссылку на Steam профиль или SteamID64 — например `https://steamcommunity.com/profiles/7656…`",
         "auto_check": True,           # check the author's inventory right in a new ticket
         "reminder_enabled": False,    # ping while a ticket is not taken
         "reminder_minutes": 30,
@@ -45,6 +46,7 @@ class Store:
             "join_channels": [],   # "join to create" voice channel ids
             "temp_channels": {},   # created voice channel id -> owner / state
             "daily_stats": {},     # guild id -> date -> {speakers, workers}
+            "steam_tracking": {},  # user id -> [{steam64, nickname, last_status, added_at}]
         }
         if path.exists():
             self.data.update(json.loads(path.read_text(encoding="utf-8")))
