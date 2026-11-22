@@ -16,6 +16,7 @@ import config
 import message_builder
 import tickets
 import voice
+import leaderboard as lb
 from config import GAMES
 from storage import store
 
@@ -65,6 +66,7 @@ class PanelAPI(commands.Cog):
         r.add_get("/internal/guilds/{gid}", self.guild_info)
         r.add_patch("/internal/guilds/{gid}/settings", self.update_settings)
         r.add_post("/internal/guilds/{gid}/panel", self.repost_panel)
+        r.add_post("/internal/guilds/{gid}/leaderboard-panel", self.post_leaderboard_panel)
         r.add_get("/internal/guilds/{gid}/banner", self.get_banner)
         r.add_post("/internal/guilds/{gid}/banner", self.upload_banner)
         r.add_delete("/internal/guilds/{gid}/banner", self.delete_banner)
@@ -162,6 +164,10 @@ class PanelAPI(commands.Cog):
             "banner_url": settings["banner_url"],
             "banner_file": bool(settings["banner_file"]),
             "games": {k: {**g, "role": sid(g.get("role"))} for k, g in settings["games"].items()},
+            "speakers_leaderboard_channel": sid(settings["speakers_leaderboard_channel"]),
+            "workers_leaderboard_channel": sid(settings["workers_leaderboard_channel"]),
+            "speaker_role": sid(settings["speaker_role"]),
+            "worker_role": sid(settings["worker_role"]),
         }
 
     @staticmethod
@@ -303,6 +309,21 @@ class PanelAPI(commands.Cog):
                 settings["games"][key] = {"enabled": bool(game.get("enabled")), "emoji": emoji, "role": role}
             if not any(g["enabled"] for g in settings["games"].values()):
                 raise fail(400, "Оставьте включённой хотя бы одну игру")
+        
+        # Leaderboard settings
+        for key in ("speakers_leaderboard_channel", "workers_leaderboard_channel"):
+            if key in body:
+                cid = parse_id(body[key])
+                if cid and not isinstance(guild.get_channel(cid), discord.TextChannel):
+                    raise fail(400, "Канал для лидерборда не найден на сервере")
+                settings[key] = cid
+        for key in ("speaker_role", "worker_role"):
+            if key in body:
+                role = parse_id(body[key])
+                if role and guild.get_role(role) is None:
+                    raise fail(400, "Роль не найдена на сервере")
+                settings[key] = role
+        
         store.save()
 
         warning = None
@@ -335,6 +356,53 @@ class PanelAPI(commands.Cog):
             raise fail(400, "Сначала выберите канал для панели тикетов")
         message = await tickets.post_panel(self.bot, guild.id, force=True)
         return web.json_response({"url": message.jump_url if message else None})
+
+    async def post_leaderboard_panel(self, request: web.Request):
+        """Publish or refresh leaderboard panels (speakers and/or workers)."""
+        _, guild, _ = await self.manageable(request)
+        body = await request.json()
+        panel_type = body.get("type")  # "speakers" or "workers"
+        
+        settings = store.settings(guild.id)
+        result = {}
+        
+        if panel_type == "speakers":
+            if not settings["speakers_leaderboard_channel"]:
+                raise fail(400, "Сначала выберите канал для лидерборда спикеров")
+            await lb.refresh_speakers_panel(self.bot, guild.id)
+            panel = store.data["panels"].get(f"speakers_leaderboard:{guild.id}")
+            if panel:
+                result["speakers_url"] = f"https://discord.com/channels/{guild.id}/{panel['channel']}/{panel['message']}"
+        
+        elif panel_type == "workers":
+            if not settings["workers_leaderboard_channel"]:
+                raise fail(400, "Сначала выберите канал для лидерборда воркеров")
+            await lb.refresh_workers_panel(self.bot, guild.id)
+            panel = store.data["panels"].get(f"workers_leaderboard:{guild.id}")
+            if panel:
+                result["workers_url"] = f"https://discord.com/channels/{guild.id}/{panel['channel']}/{panel['message']}"
+        
+        elif panel_type == "both":
+            # Publish both panels
+            if settings["speakers_leaderboard_channel"]:
+                await lb.refresh_speakers_panel(self.bot, guild.id)
+                panel = store.data["panels"].get(f"speakers_leaderboard:{guild.id}")
+                if panel:
+                    result["speakers_url"] = f"https://discord.com/channels/{guild.id}/{panel['channel']}/{panel['message']}"
+            
+            if settings["workers_leaderboard_channel"]:
+                await lb.refresh_workers_panel(self.bot, guild.id)
+                panel = store.data["panels"].get(f"workers_leaderboard:{guild.id}")
+                if panel:
+                    result["workers_url"] = f"https://discord.com/channels/{guild.id}/{panel['channel']}/{panel['message']}"
+            
+            if not result:
+                raise fail(400, "Сначала настройте каналы для лидерборда")
+        
+        else:
+            raise fail(400, "Неверный тип панели")
+        
+        return web.json_response(result)
 
     def banner_path(self, guild_id: int):
         name = store.settings(guild_id)["banner_file"]
