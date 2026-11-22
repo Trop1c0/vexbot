@@ -320,6 +320,21 @@ def game_emoji(guild_id: int, key: str) -> str:
     return store.settings(guild_id)["games"].get(key, {}).get("emoji") or GAMES[key]["emoji"]
 
 
+def faceit_level_display(guild: discord.Guild, level: int) -> str:
+    """Try to find emoji like :1lvl:, :2lvl:, etc. If not found, return 'lvl N'."""
+    if not guild:
+        return f"lvl {level}"
+    
+    # Try to find emoji with name like "1lvl", "2lvl", etc.
+    emoji_name = f"{level}lvl"
+    for emoji in guild.emojis:
+        if emoji.name.lower() == emoji_name:
+            return str(emoji)
+    
+    # If not found, return text
+    return f"lvl {level}"
+
+
 def price_text(g: dict, mode: str) -> str:
     """'111.62$' or, when both sources are shown, '111.62$ (Steam) · 98.40$ (LZT)'."""
     if mode == "both":
@@ -360,7 +375,7 @@ def inventory_rows(guild_id: int, games: dict[str, dict], mode: str) -> list[str
     return rows
 
 
-def result_view(guild_id: int, steam64: str, summary: dict | None, faceit: dict | None,
+def result_view(guild: discord.Guild, steam64: str, summary: dict | None, faceit: dict | None,
                 games: dict[str, dict], unpriced: int, requested_by: str, mode: str = "steam") -> discord.ui.LayoutView:
     lines = []
     if summary:
@@ -383,12 +398,13 @@ def result_view(guild_id: int, steam64: str, summary: dict | None, faceit: dict 
             if region.get("region"):
                 line += f" `{region['region']}` {FACEIT_REGIONS.get(region['region'], '')}"
             if region.get("skill_level"):
-                line += f" · lvl {region['skill_level']} · {region.get('faceit_elo', '?')} elo"
+                level_display = faceit_level_display(guild, region['skill_level'])
+                line += f" · {level_display} · {region.get('faceit_elo', '?')} elo"
             lines.append(line)
         else:
             lines.append("▪️ **FACEIT Profile:** не найден")
 
-    rows = inventory_rows(guild_id, games, mode)
+    rows = inventory_rows(guild.id, games, mode)
     footer = f"-# {SOURCE_NOTES[mode]} · запросил {requested_by}"
     if unpriced:
         footer += f"\n-# Без цены пока {unpriced} предм. — Steam отдаёт цены медленно, повторная проверка их досчитает."
@@ -456,7 +472,7 @@ class Checker(commands.Cog):
             await reply.edit(view=status_view(text))
 
         result = await self.evaluate(steam64, message.guild.id, progress)
-        await reply.edit(view=result_view(message.guild.id, steam64, result["summary"], result["faceit"],
+        await reply.edit(view=result_view(message.guild, steam64, result["summary"], result["faceit"],
                                           result["games"], result["unpriced"], message.author.name, result["mode"]),
                          allowed_mentions=NO_PINGS)
         
