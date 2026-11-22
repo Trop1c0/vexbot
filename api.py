@@ -200,6 +200,8 @@ class PanelAPI(commands.Cog):
                               "owner": owner.display_name if owner else rec["owner"],
                               "locked": rec["locked"], "hidden": rec["hidden"]})
         panel = store.data["panels"].get(f"tickets:{guild.id}")
+        panel_speakers = store.data["panels"].get(f"speakers_leaderboard:{guild.id}")
+        panel_workers = store.data["panels"].get(f"workers_leaderboard:{guild.id}")
 
         return web.json_response({
             "guild": {"id": str(guild.id), "name": guild.name, "icon": guild.icon.url if guild.icon else None,
@@ -214,6 +216,8 @@ class PanelAPI(commands.Cog):
             "emojis": [{"id": str(e.id), "name": e.name, "value": str(e), "url": e.url} for e in guild.emojis],
             "games": [{"key": k, "name": v["name"], "emoji": v["emoji"]} for k, v in GAMES.items()],
             "panel": {"channel": sid(panel["channel"]), "url": f"https://discord.com/channels/{guild.id}/{panel['channel']}/{panel['message']}"} if panel else None,
+            "panel_speakers": f"https://discord.com/channels/{guild.id}/{panel_speakers['channel']}/{panel_speakers['message']}" if panel_speakers else None,
+            "panel_workers": f"https://discord.com/channels/{guild.id}/{panel_workers['channel']}/{panel_workers['message']}" if panel_workers else None,
             "tickets": [{
                 "id": t["id"], "game": GAMES[t["game"]]["name"], "user": str(t["user"]), "username": t["username"],
                 "deal": tickets.DEALS[t["deal"]][0] if t.get("deal") in tickets.DEALS else None,
